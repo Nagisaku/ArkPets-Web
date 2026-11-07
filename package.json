@@ -6,6 +6,7 @@
   "scripts": {
     "build": "webpack --mode production",
     "dev": "webpack serve --mode development",
+    "models": "node scripts/fetch-models.mjs",
     "type-check": "tsc --noEmit"
   },
   "devDependencies": {

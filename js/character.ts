@@ -4,34 +4,47 @@ import outlineFragmentShader from '../shaders/OutlineFragment.glsl';
 import outlineVertexShader from '../shaders/OutlineVertex.glsl';
 import { CharacterModel } from './types.js';
 
-const MOVING_SPEED = 30; // pixels per second
+const MOVING_SPEED = 40; // pixels per second, before displayScale
 
 const GRAVITY = 1000; // pixels per second squared
-const DRAG = 0.98; // air resistance
+const DRAG = 0.98; // velocity kept per 1/60s; air resistance
 const MAX_VELOCITY = 1000; // maximum velocity in pixels per second
 const MIN_VELOCITY = 5; // threshold for stopping
 const BOUNCE_DAMPING = 0.7; // energy loss on bounce
 
-// Canvas size in pixels (pixels in screen)
-const CANVAS_WIDTH = 150;
-const CANVAS_HEIGHT = 150;
+// Sizes in CSS pixels, before displayScale. Some Special animations reach about 155px
+// either side of the model's center, so the canvas is wider than the body it holds.
+// Screen edges collide with the body: the empty sides of the canvas may hang off-screen.
+const CANVAS_WIDTH = 320;
+const CANVAS_HEIGHT = 170;
+const BODY_WIDTH = 150;
+const MODEL_SCALE = 0.3 * 0.75;
+// Supersampling beyond 2x costs fill rate without a visible gain at this size
+const MAX_PIXEL_RATIO = 2;
+const ANIMATION_MIX_SECONDS = 0.3;
 
-const ANIMATION_NAMES = ["Relax", "Interact", "Move", "Sit" , "Sleep"];
-const ANIMATION_MARKOV = [
-    [0.5, 0.0, 0.25, 0.15, 0.1],
-    [1.0, 0.0, 0.0, 0.0, 0.0],
-    [0.2, 0.0, 0.8, 0.0, 0.0],
-    [0.3, 0.0, 0.0, 0.7, 0.0],
-    [0.1, 0.0, 0.0, 0.0, 0.9],
-]
+const DRAG_SLOP = 6; // pixels a pointer may travel and still count as a click or tap
+const LONG_PRESS_MS = 500;
+const TOUCH_HIT_RADIUS = 12; // fingers are less precise than a mouse
 
-// Vehicle can't sit & sleep
-const ANIMATION_NAMES_VEHICLE = ["Relax", "Interact", "Move"];
-const ANIMATION_MARKOV_VEHICLE = [
-    [0.5, 0.0, 0.5],
-    [1.0, 0.0, 0.0],
-    [0.3, 0.0, 0.7],
-]
+interface Behavior {
+    // Seconds to stay in this animation. Checked at loop boundaries, so it always finishes a loop.
+    minSeconds: number;
+    maxSeconds: number;
+    // Play a single loop, then move on
+    once?: boolean;
+    // Relative weights of what comes next. Animations a model lacks are skipped.
+    next: { [animation: string]: number };
+}
+
+const BEHAVIORS: { [animation: string]: Behavior } = {
+    Relax: { minSeconds: 2, maxSeconds: 6, next: { Move: 6, Sit: 1.5, Sleep: 0.5, Special: 1, Interact: 0.5, Relax: 1 } },
+    Move: { minSeconds: 4, maxSeconds: 12, next: { Relax: 7, Move: 2, Sit: 1 } },
+    Sit: { minSeconds: 8, maxSeconds: 20, next: { Relax: 4, Sleep: 1 } },
+    Sleep: { minSeconds: 15, maxSeconds: 40, next: { Relax: 1 } },
+    Interact: { minSeconds: 0, maxSeconds: 0, once: true, next: { Relax: 1 } },
+    Special: { minSeconds: 0, maxSeconds: 0, once: true, next: { Relax: 1 } },
+};
 
 interface SpineCharacter {
     skeleton: spine.Skeleton;
@@ -42,6 +55,7 @@ interface Action {
     animation: string;
     direction: Direction;
     timestamp: number;
+    duration: number;
 }
 
 type Direction = "left" | "right";
@@ -61,51 +75,66 @@ export class Character {
     private quadBuffer!: WebGLBuffer;
 
     private isMouseOver: boolean = false;
-    
+
     // Dragging state
     private isDragging: boolean = false;
+    private dragMoved: boolean = false;
+    private dragOriginX: number = 0;
+    private dragOriginY: number = 0;
     private dragStartRelativeX: number = 0;
     private dragStartRelativeY: number = 0;
-    private lastDragEvent: MouseEvent | null = null;
-    
+    private lastDragTime: number | null = null;
+    private longPressTimer: number | null = null;
+    private longPressFired: boolean = false;
+
     // Physics state
     private velocity = { x: 0, y: 0 };
-    
+
     private model: CharacterModel;
     private character!: SpineCharacter;
-    
+    private animationNames: string[] = [];
+
     private currentAction: Action = {
         animation: "Relax",
         direction: "right",
-        timestamp: 0
+        timestamp: 0,
+        duration: 0,
     };
-    
+
     private position: { x: number; y: number } = {
-        x: -1, // will be set to a random value
+        x: NaN, // will be set to a random value
         y: 1e9 // will be bounded to the bottom of the window
     };
 
     private animationFrameId: number | null = null;
-
-    // Vehicle can't sit & sleep
-    private isVehicle: boolean = false;
+    // Only the newest loadCharacterModel call may take effect
+    private loadToken: number = 0;
+    private listeners = new AbortController();
 
     private allowInteract: boolean = true;
+    private displayScale: number;
 
     // Supersampling is necessary for high-res display
     private pixelRatio!: number;
 
-    constructor(canvasId: string, onContextMenu: (e: MouseEvent | TouchEvent) => void, initialCharacter: CharacterModel, allowInteract: boolean = true) {
+    constructor(
+        canvasId: string,
+        private onContextMenu: (e: MouseEvent | TouchEvent) => void,
+        initialCharacter: CharacterModel,
+        allowInteract: boolean = true,
+        displayScale: number = 1,
+    ) {
         this.allowInteract = allowInteract;
+        this.displayScale = displayScale;
         this.model = initialCharacter;
         this.mvp = new webgl.Matrix4();
-        this.pixelRatio = window.devicePixelRatio ?? 2;
-        
+        this.pixelRatio = Math.min(window.devicePixelRatio || 1, MAX_PIXEL_RATIO);
+
         // Initialize canvas and WebGL
         this.initializeCanvas(canvasId);
         this.initializeWebGL();
-        this.setupEventListeners(onContextMenu);
-        
+        this.setupEventListeners();
+
         // Load initial character
         this.loadFromSessionStorage();
         this.loadCharacterModel(this.model);
@@ -120,48 +149,53 @@ export class Character {
     }
 
     private initializeWebGL(): void {
-        this.gl = this.canvas.getContext("webgl", {
+        const gl = this.canvas.getContext("webgl", {
             alpha: true,
-            premultipliedAlpha: false
-        }) as WebGLRenderingContext;
+            // Ark-Models textures are premultiplied, and so is everything we composite
+            premultipliedAlpha: true
+        }) as WebGLRenderingContext | null;
 
-        if (!this.gl) {
+        if (!gl) {
+            this.canvas.remove();
             throw new Error('WebGL is unavailable.');
         }
+        this.gl = gl;
 
-        // Set up WebGL context
-        this.gl.enable(this.gl.BLEND);
-        this.gl.blendFunc(this.gl.SRC_ALPHA, this.gl.ONE_MINUS_SRC_ALPHA);
-        
         this.initFramebuffer();
-        
+
         // Create WebGL objects
         this.shader = webgl.Shader.newTwoColoredTextured(this.gl);
         this.batcher = new webgl.PolygonBatcher(this.gl);
         this.skeletonRenderer = new webgl.SkeletonRenderer(new webgl.ManagedWebGLRenderingContext(this.gl));
+        this.skeletonRenderer.premultipliedAlpha = true;
         this.assetManager = new webgl.AssetManager(this.gl);
     }
 
-    private setupEventListeners(onContextMenu: (e: MouseEvent | TouchEvent) => void): void {
+    private setupEventListeners(): void {
+        const { signal } = this.listeners;
+
         // Track mouse position to decide mouse over
-        document.addEventListener('mousemove', this.handleMouseMove.bind(this));
+        document.addEventListener('mousemove', this.handleMouseMove.bind(this), { signal });
+        window.addEventListener('pagehide', this.saveToSessionStorage.bind(this), { signal });
 
         if (this.allowInteract) {
             // React to click events
-            this.canvas.addEventListener('click', this.handleCanvasClick.bind(this));
+            this.canvas.addEventListener('click', this.handleCanvasClick.bind(this), { signal });
 
             // Context menu
-            this.canvas.addEventListener('contextmenu', onContextMenu);
+            this.canvas.addEventListener('contextmenu', this.onContextMenu, { signal });
 
             // Mouse events
-            this.canvas.addEventListener('mousedown', this.handleDragStart.bind(this));
-            document.addEventListener('mousemove', this.handleDrag.bind(this));
-            document.addEventListener('mouseup', this.handleDragEnd.bind(this));
-            
-            // Touch events
-            this.canvas.addEventListener('touchstart', this.handleDragStart.bind(this));
-            document.addEventListener('touchmove', this.handleDrag.bind(this));
-            document.addEventListener('touchend', this.handleDragEnd.bind(this));
+            this.canvas.addEventListener('mousedown', this.handleMouseDown.bind(this), { signal });
+            document.addEventListener('mousemove', this.handleMouseDrag.bind(this), { signal });
+            document.addEventListener('mouseup', this.endDrag.bind(this), { signal });
+
+            // The canvas only takes pointer events while hovered, which never happens on touch.
+            // So check touches on the document, and ignore the ones that miss the pet.
+            document.addEventListener('touchstart', this.handleTouchStart.bind(this), { signal, passive: false, capture: true });
+            document.addEventListener('touchmove', this.handleTouchMove.bind(this), { signal, passive: false });
+            document.addEventListener('touchend', this.handleTouchEnd.bind(this), { signal });
+            document.addEventListener('touchcancel', this.handleTouchEnd.bind(this), { signal });
         }
     }
 
@@ -196,20 +230,17 @@ export class Character {
         const vertexShader = this.gl.createShader(this.gl.VERTEX_SHADER)!;
         this.gl.shaderSource(vertexShader, outlineVertexShader);
         this.gl.compileShader(vertexShader);
+        if (!this.gl.getShaderParameter(vertexShader, this.gl.COMPILE_STATUS)) {
+            console.error('Vertex shader compilation failed:', this.gl.getShaderInfoLog(vertexShader));
+        }
 
         const fragmentShader = this.gl.createShader(this.gl.FRAGMENT_SHADER)!;
         this.gl.shaderSource(fragmentShader, outlineFragmentShader);
         this.gl.compileShader(fragmentShader);
-
-        // Compile shaders
-        this.gl.compileShader(vertexShader);
-        if (!this.gl.getShaderParameter(vertexShader, this.gl.COMPILE_STATUS)) {
-            console.error('Vertex shader compilation failed:', this.gl.getShaderInfoLog(vertexShader));
-        }
-        this.gl.compileShader(fragmentShader);
         if (!this.gl.getShaderParameter(fragmentShader, this.gl.COMPILE_STATUS)) {
             console.error('Fragment shader compilation failed:', this.gl.getShaderInfoLog(fragmentShader));
         }
+
         this.outlineShader = this.gl.createProgram()!;
         this.gl.attachShader(this.outlineShader, vertexShader);
         this.gl.attachShader(this.outlineShader, fragmentShader);
@@ -220,12 +251,12 @@ export class Character {
     }
 
     public loadCharacterModel(model: CharacterModel) {
-        this.model = model;
-        
+        const token = ++this.loadToken;
+
         function encodeUriPath(path: string): string {
             return encodeURIComponent(path).replace(/%2F/g, '/');
         }
-        console.log("Downloading character assets for", model.name);
+        console.debug("Downloading character assets for", model.name);
 
         // Download all resources.
         // Here we use `setRawDataURI()` to manually load the resources because the path may contain `#` which is not allowed in URLs
@@ -233,13 +264,28 @@ export class Character {
         const basePath = model.resourcePath ?? "";
         Promise.all(resources.map(async resource => {
             const response = await fetch(basePath + encodeUriPath(resource));
+            if (!response.ok) {
+                throw new Error(`${resource}: HTTP ${response.status}`);
+            }
             const blob = await response.blob();
             const reader = new FileReader();
-            return new Promise<string>(resolve => {
+            return new Promise<string>((resolve, reject) => {
                 reader.onloadend = () => resolve(reader.result as string);
+                reader.onerror = () => reject(reader.error);
                 reader.readAsDataURL(blob);
             });
         })).then(dataUrls => {
+            if (token !== this.loadToken) {
+                return; // a newer request or destroy() superseded this one
+            }
+
+            // The previous model keeps playing until the new one has fully arrived
+            if (this.animationFrameId !== null) {
+                cancelAnimationFrame(this.animationFrameId);
+                this.animationFrameId = null;
+            }
+            this.model = model;
+
             resources.forEach((resource, i) => {
                 this.assetManager.setRawDataURI(resource, dataUrls[i]);
             });
@@ -247,21 +293,16 @@ export class Character {
             this.assetManager.removeAll();
             this.assetManager.loadBinary(model.skeleton, () => {
                 this.assetManager.loadTextureAtlas(model.atlas, () => {
-                    console.log("Loaded character assets for", model.name);
+                    console.debug("Loaded character assets for", model.name);
                     resources.forEach((resource) => {
                         this.assetManager.setRawDataURI(resource, ""); // release memory
                     });
-                    requestAnimationFrame(this.load.bind(this));
+                    this.animationFrameId = requestAnimationFrame(() => this.load(token));
                 });
             });
         }).catch(error => {
             console.error("Failed to load character assets:", error);
         });
-
-        if (this.animationFrameId !== null) {
-            cancelAnimationFrame(this.animationFrameId);
-            this.animationFrameId = null;
-        }
     }
 
     public fadeOut(): Promise<void> {
@@ -270,7 +311,7 @@ export class Character {
             const fadeInterval = setInterval(() => {
                 opacity -= 0.1;
                 this.canvas.style.opacity = opacity.toString();
-                
+
                 if (opacity <= 0) {
                     clearInterval(fadeInterval);
                     resolve();
@@ -279,51 +320,59 @@ export class Character {
         });
     }
 
+    private sessionKey(): string {
+        return 'arkpets-character-' + this.canvas.id;
+    }
+
     private saveToSessionStorage(): void {
-        sessionStorage.setItem('arkpets-character-' + this.canvas.id, JSON.stringify({
-            position: this.position,
-            currentAction: this.currentAction,
-            characterResource: this.model
-        }));
+        try {
+            sessionStorage.setItem(this.sessionKey(), JSON.stringify({ position: this.position }));
+        } catch (e) { /* storage may be blocked; losing the position is harmless */ }
     }
 
     private loadFromSessionStorage(): void {
-        const saved = sessionStorage.getItem('arkpets-character-' + this.canvas.id);
-        if (saved) {
-            const state = JSON.parse(saved);
-            this.position = state.position;
-            this.currentAction = state.currentAction;
-            this.model = state.characterResource;
-        }
+        try {
+            const saved = sessionStorage.getItem(this.sessionKey());
+            if (saved) {
+                this.position = JSON.parse(saved).position ?? this.position;
+            }
+        } catch (e) { /* start from the default position */ }
     }
 
-    private load(): void {
-        if (this.assetManager.isLoadingComplete()) {
-            this.character = this.loadCharacter(this.model, 0.3 * 0.75 * this.pixelRatio);
-
-            if (!this.getAnimationNames().includes(this.currentAction.animation)) {
-                // If swithing from character to vehicle, make sure it's not in `Sleep` or `Sit`
-                this.currentAction.animation = "Relax";
-                this.currentAction.timestamp = 0;
-            }
-            this.character.state.setAnimation(0, this.currentAction.animation, true);
-            this.character.state.update(this.currentAction.timestamp);
-
-            this.lastFrameTime = Date.now() / 1000;
-
-            // Generate random x position if it's not set yet
-            if (this.position.x === -1) {
-                this.position.x = Math.random() * (window.innerWidth - this.canvas.offsetWidth);
-            }
-
-            requestAnimationFrame(this.render.bind(this));
-        } else {
+    private load(token: number): void {
+        if (token !== this.loadToken) {
+            return;
+        }
+        if (!this.assetManager.isLoadingComplete()) {
             console.debug("Loading assets of character", this.model.name, "progress", this.assetManager.getLoaded(), "/", this.assetManager.getToLoad());
-            requestAnimationFrame(this.load.bind(this));
+            this.animationFrameId = requestAnimationFrame(() => this.load(token));
+            return;
         }
+
+        this.character = this.loadCharacter(this.model, MODEL_SCALE * this.pixelRatio * this.displayScale);
+        this.currentAction = this.makeAction("Relax", this.currentAction.direction);
+        this.character.state.setAnimation(0, "Relax", true);
+
+        this.lastFrameTime = Date.now() / 1000;
+
+        // Generate random x position if it's not set yet
+        if (!Number.isFinite(this.position.x)) {
+            const { minX, maxX } = this.horizontalBounds();
+            this.position.x = minX + Math.random() * (maxX - minX);
+        }
+
+        this.animationFrameId = requestAnimationFrame(this.render.bind(this));
     }
 
-    private loadCharacter(resource: CharacterModel, scale: number = 1.0): SpineCharacter {    
+    private horizontalBounds(): { minX: number; maxX: number } {
+        const margin = (CANVAS_WIDTH - BODY_WIDTH) / 2 * this.displayScale;
+        return {
+            minX: -margin,
+            maxX: Math.max(-margin, window.innerWidth - this.canvas.offsetWidth + margin),
+        };
+    }
+
+    private loadCharacter(resource: CharacterModel, scale: number = 1.0): SpineCharacter {
         const atlas = this.assetManager.get(resource.atlas);
         const atlasLoader = new spine.AtlasAttachmentLoader(atlas);
         const skeletonBinary = new spine.SkeletonBinary(atlasLoader);
@@ -332,44 +381,40 @@ export class Character {
         const skeletonData = skeletonBinary.readSkeletonData(this.assetManager.get(resource.skeleton));
         const skeleton = new spine.Skeleton(skeletonData);
 
-        if (!skeletonData.findAnimation("Sit") || !skeletonData.findAnimation("Sleep")) {
-            this.isVehicle = true;
-        }
+        this.animationNames = Object.keys(BEHAVIORS).filter(name => skeletonData.findAnimation(name) !== null);
 
         const animationStateData = new spine.AnimationStateData(skeleton.data);
 
         // Animation transitions
-        this.getAnimationNames().forEach(fromAnim => {
-            this.getAnimationNames().forEach(toAnim => {
+        this.animationNames.forEach(fromAnim => {
+            this.animationNames.forEach(toAnim => {
                 if (fromAnim !== toAnim) {
-                    animationStateData.setMix(fromAnim, toAnim, 0.3);
+                    animationStateData.setMix(fromAnim, toAnim, ANIMATION_MIX_SECONDS);
                 }
             });
         });
 
         const animationState = new spine.AnimationState(animationStateData);
-        animationState.setAnimation(0, "Relax", true);
 
         // Listen for animation completion
         const self = this;
         class AnimationStateAdapter extends spine.AnimationStateAdapter {
             complete(entry: spine.TrackEntry): void {
-                const action = self.nextAction(self.currentAction);
-                self.currentAction = action;
-                console.debug("Play action", action)
-                animationState.setAnimation(0, action.animation, true);
+                self.handleLoopComplete();
             }
         }
         animationState.addListener(new AnimationStateAdapter());
 
         // Set canvas display size
-        this.canvas.style.width = CANVAS_WIDTH + "px";
-        this.canvas.style.height = CANVAS_HEIGHT + "px";
+        const cssWidth = Math.round(CANVAS_WIDTH * this.displayScale);
+        const cssHeight = Math.round(CANVAS_HEIGHT * this.displayScale);
+        this.canvas.style.width = cssWidth + "px";
+        this.canvas.style.height = cssHeight + "px";
 
         // Set canvas internal resolution
-        this.canvas.width = CANVAS_WIDTH * this.pixelRatio;
-        this.canvas.height = CANVAS_HEIGHT * this.pixelRatio;
-        
+        this.canvas.width = Math.round(cssWidth * this.pixelRatio);
+        this.canvas.height = Math.round(cssHeight * this.pixelRatio);
+
         // Update the projection matrix to match the new resolution
         this.mvp.ortho2d(0, 0, this.canvas.width, this.canvas.height);
         this.gl.viewport(0, 0, this.canvas.width, this.canvas.height);
@@ -396,6 +441,21 @@ export class Character {
         this.currentMousePos.y = event.clientY;
     }
 
+    // Whether the pet has an opaque pixel at this client position, as of the last rendered frame.
+    private isOpaqueAt(clientX: number, clientY: number): boolean {
+        const rect = this.canvas.getBoundingClientRect();
+        const pixelX = (clientX - rect.x) * this.pixelRatio;
+        const pixelY = this.canvas.height - (clientY - rect.y) * this.pixelRatio;
+        if (pixelX < 0 || pixelX >= this.canvas.width || pixelY < 0 || pixelY >= this.canvas.height) {
+            return false;
+        }
+        const pixel = new Uint8Array(4);
+        this.gl.bindFramebuffer(this.gl.FRAMEBUFFER, this.framebuffer);
+        this.gl.readPixels(pixelX, pixelY, 1, 1, this.gl.RGBA, this.gl.UNSIGNED_BYTE, pixel);
+        this.gl.bindFramebuffer(this.gl.FRAMEBUFFER, null);
+        return pixel[3] !== 0;
+    }
+
     private render(): void {
         const now = Date.now() / 1000;
         // Limit delta to 0.1s, effectively pausing the animation when the window is in background
@@ -403,42 +463,42 @@ export class Character {
         this.lastFrameTime = now;
         this.currentAction.timestamp += delta;
 
+        const { minX, maxX } = this.horizontalBounds();
+        const maxY = window.innerHeight - this.canvas.offsetHeight;
+
         // Apply physics when not dragging
         if (!this.isDragging) {
             // Apply gravity
             this.velocity.y += GRAVITY * delta;
-            
+
             // Apply drag
-            this.velocity.x *= DRAG;
-            this.velocity.y *= DRAG;
+            const drag = Math.pow(DRAG, delta * 60); // the same fall on any refresh rate
+            this.velocity.x *= drag;
+            this.velocity.y *= drag;
             if (Math.abs(this.velocity.x) < MIN_VELOCITY) {
                 this.velocity.x = 0;
             }
             if (Math.abs(this.velocity.y) < MIN_VELOCITY) {
                 this.velocity.y = 0;
             }
-            
+
             // Clamp velocities
             this.velocity.x = Math.max(-MAX_VELOCITY, Math.min(MAX_VELOCITY, this.velocity.x));
             this.velocity.y = Math.max(-MAX_VELOCITY, Math.min(MAX_VELOCITY, this.velocity.y));
-            
+
             // Update position
             this.position.x += this.velocity.x * delta;
             this.position.y += this.velocity.y * delta;
-            
-            // Window bounds collision
-            const maxX = window.innerWidth - this.canvas.offsetWidth;
-            const maxY = window.innerHeight - this.canvas.offsetHeight;
-            
+
             // Bounce off walls
-            if (this.position.x < 0) {
-                this.position.x = 0;
+            if (this.position.x < minX) {
+                this.position.x = minX;
                 this.velocity.x = -this.velocity.x * BOUNCE_DAMPING;
             } else if (this.position.x > maxX) {
                 this.position.x = maxX;
                 this.velocity.x = -this.velocity.x * BOUNCE_DAMPING;
             }
-            
+
             // Bounce off floor/ceiling
             if (this.position.y < 0) {
                 this.position.y = 0;
@@ -447,24 +507,24 @@ export class Character {
                 this.position.y = maxY;
                 this.velocity.y = 0;
             }
-        }
 
-        // Move the canvas when "Move" animation is playing
-        if (this.currentAction.animation === "Move") {
-            const movement = MOVING_SPEED * delta;
-            if (this.currentAction.direction === "left") {
-                this.position.x = Math.max(0, this.position.x - movement);
-                // Turn around when reaching left edge
-                if (this.position.x <= 0) {
-                    this.position.x = 0;
-                    this.currentAction.direction = "right";
-                }
-            } else {
-                this.position.x = this.position.x + movement;
-                // Turn around when reaching right edge
-                if (this.position.x >= window.innerWidth - this.canvas.offsetWidth) {
-                    this.position.x = window.innerWidth - this.canvas.offsetWidth;
-                    this.currentAction.direction = "left";
+            // Walk while the "Move" animation plays, but not in mid-air
+            if (this.currentAction.animation === "Move" && this.position.y >= maxY) {
+                const movement = MOVING_SPEED * this.displayScale * delta;
+                if (this.currentAction.direction === "left") {
+                    this.position.x -= movement;
+                    // Turn around when reaching left edge
+                    if (this.position.x <= minX) {
+                        this.position.x = minX;
+                        this.currentAction.direction = "right";
+                    }
+                } else {
+                    this.position.x += movement;
+                    // Turn around when reaching right edge
+                    if (this.position.x >= maxX) {
+                        this.position.x = maxX;
+                        this.currentAction.direction = "left";
+                    }
                 }
             }
         }
@@ -477,7 +537,7 @@ export class Character {
         this.gl.viewport(0, 0, this.canvas.width, this.canvas.height);
         this.gl.clearColor(0, 0, 0, 0);
         this.gl.clear(this.gl.COLOR_BUFFER_BIT);
-        
+
         this.character.skeleton.scaleX = this.currentAction.direction === "left" ? -1 : 1;
 
         this.character.state.update(delta);
@@ -489,43 +549,22 @@ export class Character {
         this.shader.setUniform4x4f(webgl.Shader.MVP_MATRIX, this.mvp.values);
 
         this.batcher.begin(this.shader);
-        this.skeletonRenderer.premultipliedAlpha = false;
         this.skeletonRenderer.draw(this.batcher, this.character.skeleton);
         this.batcher.end();
 
         this.shader.unbind();
 
         // Read pixels before 2nd pass to determine if mouse is over character
-        const canvasRect = this.canvas.getBoundingClientRect();
-        let pixelX = (this.currentMousePos.x - canvasRect.x) * this.pixelRatio;
-        let pixelY = this.canvas.height - (this.currentMousePos.y - canvasRect.y) * this.pixelRatio;
-        if (pixelX >= 0 && pixelX < this.canvas.width && pixelY >= 0 && pixelY < this.canvas.height) {
-            // Mouse inside canvas. Check whether it's over the character
-            let pixelColor = new Uint8Array(4);
-            this.gl.readPixels(
-                pixelX, 
-                pixelY, 
-                1, 1, 
-                this.gl.RGBA, 
-                this.gl.UNSIGNED_BYTE, 
-                pixelColor
-            );
-            this.isMouseOver = pixelColor[3] !== 0;
-            if (this.allowInteract) {
-                this.canvas.style.pointerEvents = this.isMouseOver ? 'auto' : 'none';
-            } else {
-                this.canvas.style.pointerEvents = 'none';
-            }
-        } else {
-            this.isMouseOver = false;
-            this.canvas.style.pointerEvents = 'none';
-        }
+        this.isMouseOver = this.isOpaqueAt(this.currentMousePos.x, this.currentMousePos.y);
+        this.canvas.style.pointerEvents = this.allowInteract && this.isMouseOver ? 'auto' : 'none';
 
-        // 2nd pass - render to screen with outline effect
+        // 2nd pass - copy to screen with outline effect. The framebuffer is already
+        // premultiplied, so draw it without blending.
         this.gl.bindFramebuffer(this.gl.FRAMEBUFFER, null);
         this.gl.viewport(0, 0, this.canvas.width, this.canvas.height);
         this.gl.clearColor(0, 0, 0, 0);
         this.gl.clear(this.gl.COLOR_BUFFER_BIT);
+        this.gl.disable(this.gl.BLEND);
 
         this.gl.useProgram(this.outlineShader);
 
@@ -553,171 +592,236 @@ export class Character {
         this.gl.vertexAttribPointer(aPosition, 2, this.gl.FLOAT, false, 0, 0);
         this.gl.drawArrays(this.gl.TRIANGLE_STRIP, 0, 4);
 
-        this.saveToSessionStorage();
-
         // Store the animation frame ID
         this.animationFrameId = requestAnimationFrame(this.render.bind(this));
-    }
-
-    private randomPick(probabilities: number[]): number {
-        let random = Math.random();
-        let cumulativeProb = 0;
-        for (let i = 0; i < probabilities.length; i++) {
-            cumulativeProb += probabilities[i];
-            if (random <= cumulativeProb) {
-                return i;
-            }
-        }
-        throw new Error("Invalid probabilities: " + probabilities);
     }
 
     private turnDirection(current: Direction): Direction {
         return current === "left" ? "right" : "left";
     }
 
-    private nextAction(current: Action): Action {
-        const animeIndex = this.getAnimationNames().indexOf(current.animation);
-        const nextIndexProb = this.getAnimationMarkov()[animeIndex];
-        const nextAnimIndex = this.randomPick(nextIndexProb);
-        const nextAnim = this.getAnimationNames()[nextAnimIndex];
-
-        let nextDirection = current.direction;
-        if (current.animation === "Relax" && nextAnim === "Move") {
-            nextDirection = Math.random() < 0.4 ? this.turnDirection(current.direction) : current.direction;
-        }
+    private makeAction(animation: string, direction: Direction): Action {
+        const behavior = BEHAVIORS[animation];
         return {
-            animation: nextAnim,
-            direction: nextDirection,
-            timestamp: 0
+            animation,
+            direction,
+            timestamp: 0,
+            duration: behavior.minSeconds + Math.random() * (behavior.maxSeconds - behavior.minSeconds),
         };
     }
 
+    private nextAction(current: Action): Action {
+        const weights = BEHAVIORS[current.animation].next;
+        const choices = Object.keys(weights).filter(name => this.animationNames.includes(name));
+        const total = choices.reduce((sum, name) => sum + weights[name], 0);
+
+        let roll = Math.random() * total;
+        let next = "Relax";
+        for (const name of choices) {
+            roll -= weights[name];
+            if (roll <= 0) {
+                next = name;
+                break;
+            }
+        }
+
+        const mayTurn = next === "Move" && Math.random() < 0.4;
+        return this.makeAction(next, mayTurn ? this.turnDirection(current.direction) : current.direction);
+    }
+
+    private startAction(action: Action): void {
+        const looping = !BEHAVIORS[action.animation].once;
+        // Restarting a loop that is already playing would make it visibly hitch
+        const alreadyPlaying = looping && action.animation === this.currentAction.animation;
+        this.currentAction = action;
+        if (!alreadyPlaying) {
+            this.character.state.setAnimation(0, action.animation, looping);
+        }
+        console.debug("Play action", action);
+    }
+
+    private handleLoopComplete(): void {
+        if (this.isDragging || this.currentAction.timestamp < this.currentAction.duration) {
+            return;
+        }
+        this.startAction(this.nextAction(this.currentAction));
+    }
+
     private handleCanvasClick(): void {
-        if (this.character && this.character.state) {
-            this.currentAction = {
-                animation: "Interact",
-                direction: this.currentAction.direction,
-                timestamp: 0,
-            };
-            this.character.state.setAnimation(0, "Interact", false);
-            console.debug("Play action", this.currentAction);
+        if (!this.dragMoved) {
+            this.interact();
         }
     }
 
-    private handleDragStart(e: MouseEvent | TouchEvent): void {
-        if ((e as MouseEvent).button === undefined || (e as MouseEvent).button === 0) {
-            this.isDragging = true;
-            
-            const clientX = 'touches' in e ? e.touches[0].clientX : (e as MouseEvent).clientX;
-            const clientY = 'touches' in e ? e.touches[0].clientY : (e as MouseEvent).clientY;
-            this.dragStartRelativeX = clientX - this.position.x;
-            this.dragStartRelativeY = clientY - this.position.y;
-            
-            // Pause any current animation
-            if (this.character && this.character.state) {
-                this.character.state.setAnimation(0, "Relax", true);
-                this.currentAction = {
-                    animation: "Relax",
-                    direction: this.currentAction.direction,
-                    timestamp: 0
-                };
-            }
+    private interact(): void {
+        if (this.character && this.animationNames.includes("Interact")) {
+            this.startAction(this.makeAction("Interact", this.currentAction.direction));
         }
     }
 
-    private handleDrag(e: MouseEvent | TouchEvent): void {
-        if (this.isDragging) {
-            const clientX = 'touches' in e ? e.touches[0].clientX : (e as MouseEvent).clientX;
-            const clientY = 'touches' in e ? e.touches[0].clientY : (e as MouseEvent).clientY;
-            
-            const oldX = this.position.x;
-            const oldY = this.position.y;
-            const newX = clientX - this.dragStartRelativeX;
-            const newY = clientY - this.dragStartRelativeY;
-            
-            // Calculate velocity based on time between events
-            if (this.lastDragEvent) {
-                const dt = (e.timeStamp - this.lastDragEvent.timeStamp) / 1000;
-                if (dt > 0) {
-                    this.velocity.x = (newX - oldX) / dt;
-                    this.velocity.y = (newY - oldY) / dt;
-                }
-            }
-            
-            // Update position
-            this.position.x = newX;
-            this.position.y = newY;
-            this.canvas.style.transform = `translate(${this.position.x}px, ${this.position.y}px)`;
-            
-            this.lastDragEvent = e as MouseEvent;
-            
-            // Prevent scrolling on mobile
-            if ('touches' in e) {
-                e.preventDefault();
-            }
+    private beginDrag(clientX: number, clientY: number): void {
+        this.isDragging = true;
+        this.dragMoved = false;
+        this.dragOriginX = clientX;
+        this.dragOriginY = clientY;
+        this.dragStartRelativeX = clientX - this.position.x;
+        this.dragStartRelativeY = clientY - this.position.y;
+        this.velocity = { x: 0, y: 0 };
+        this.lastDragTime = null;
+
+        // Pause any current animation
+        if (this.character) {
+            this.startAction(this.makeAction("Relax", this.currentAction.direction));
         }
     }
 
-    private handleDragEnd(): void {
+    private moveDrag(clientX: number, clientY: number, timeStamp: number): void {
+        const newX = clientX - this.dragStartRelativeX;
+        const newY = clientY - this.dragStartRelativeY;
+
+        // Calculate velocity based on time between events
+        if (this.lastDragTime !== null) {
+            const dt = (timeStamp - this.lastDragTime) / 1000;
+            if (dt > 0) {
+                this.velocity.x = (newX - this.position.x) / dt;
+                this.velocity.y = (newY - this.position.y) / dt;
+            }
+        }
+        this.lastDragTime = timeStamp;
+
+        if (Math.hypot(clientX - this.dragOriginX, clientY - this.dragOriginY) > DRAG_SLOP) {
+            this.dragMoved = true;
+        }
+
+        // Update position
+        this.position.x = newX;
+        this.position.y = newY;
+        this.canvas.style.transform = `translate(${this.position.x}px, ${this.position.y}px)`;
+    }
+
+    private endDrag(): void {
         this.isDragging = false;
-        this.lastDragEvent = null;
+        this.lastDragTime = null;
+    }
+
+    private handleMouseDown(e: MouseEvent): void {
+        if (e.button === 0) {
+            e.preventDefault(); // don't start a text selection
+            this.beginDrag(e.clientX, e.clientY);
+        }
+    }
+
+    private handleMouseDrag(e: MouseEvent): void {
+        if (this.isDragging) {
+            this.moveDrag(e.clientX, e.clientY, e.timeStamp);
+        }
+    }
+
+    private touchHitsPet(x: number, y: number): boolean {
+        if (!this.character) {
+            return false;
+        }
+        const r = TOUCH_HIT_RADIUS;
+        return this.isOpaqueAt(x, y)
+            || this.isOpaqueAt(x - r, y) || this.isOpaqueAt(x + r, y)
+            || this.isOpaqueAt(x, y - r) || this.isOpaqueAt(x, y + r);
+    }
+
+    private clearLongPress(): void {
+        if (this.longPressTimer !== null) {
+            clearTimeout(this.longPressTimer);
+            this.longPressTimer = null;
+        }
+    }
+
+    private handleTouchStart(e: TouchEvent): void {
+        const target = e.target as Element | null;
+        if (e.touches.length !== 1 || target?.closest?.('#arkpets-menu')) {
+            return;
+        }
+        const touch = e.touches[0];
+        if (!this.touchHitsPet(touch.clientX, touch.clientY)) {
+            return;
+        }
+
+        e.preventDefault(); // no scrolling and no synthesized mouse events
+        this.beginDrag(touch.clientX, touch.clientY);
+        this.longPressFired = false;
+        this.longPressTimer = window.setTimeout(() => {
+            this.longPressTimer = null;
+            this.longPressFired = true;
+            this.endDrag();
+            this.onContextMenu(e);
+        }, LONG_PRESS_MS);
+    }
+
+    private handleTouchMove(e: TouchEvent): void {
+        if (!this.isDragging) {
+            return;
+        }
+        e.preventDefault();
+        const touch = e.touches[0];
+        this.moveDrag(touch.clientX, touch.clientY, e.timeStamp);
+        if (this.dragMoved) {
+            this.clearLongPress();
+        }
+    }
+
+    private handleTouchEnd(): void {
+        const wasDragging = this.isDragging;
+        this.clearLongPress();
+        this.endDrag();
+        if (wasDragging && !this.dragMoved && !this.longPressFired) {
+            this.interact();
+        }
     }
 
     public destroy(): void {
+        this.loadToken++; // abandon any load still in flight
+
         if (this.animationFrameId !== null) {
             cancelAnimationFrame(this.animationFrameId);
             this.animationFrameId = null;
         }
+        this.clearLongPress();
 
         // Remove event listeners
-        this.canvas.removeEventListener('click', this.handleCanvasClick.bind(this));
-        this.canvas.removeEventListener('mousedown', this.handleDragStart.bind(this));
-        document.removeEventListener('mousemove', this.handleMouseMove.bind(this));
-        document.removeEventListener('mousemove', this.handleDrag.bind(this));
-        document.removeEventListener('mouseup', this.handleDragEnd.bind(this));
-        this.canvas.removeEventListener('touchstart', this.handleDragStart.bind(this));
-        document.removeEventListener('touchmove', this.handleDrag.bind(this));
-        document.removeEventListener('touchend', this.handleDragEnd.bind(this));
+        this.listeners.abort();
 
         // Clean up Spine resources
         if (this.character) {
             this.character.state.clearTracks();
             this.character.state.clearListeners();
         }
-        
+
         // Delete WebGL resources
         this.gl.deleteFramebuffer(this.framebuffer);
         this.gl.deleteTexture(this.framebufferTexture);
         this.gl.deleteBuffer(this.quadBuffer);
         this.gl.deleteProgram(this.outlineShader);
-        
+
         // Clear session storage
-        sessionStorage.removeItem('arkpets-character-' + this.canvas.id);
-        
+        try {
+            sessionStorage.removeItem(this.sessionKey());
+        } catch (e) { /* nothing to clear */ }
+
         // Clear asset manager
         this.assetManager.removeAll();
         this.assetManager.dispose();
+
+        // Browsers limit the number of WebGL contexts, so release this one now
+        this.gl.getExtension('WEBGL_lose_context')?.loseContext();
 
         // Remove canvas
         this.canvas.remove();
     }
 
     public getAnimationNames(): string[] {
-        return this.isVehicle ? ANIMATION_NAMES_VEHICLE : ANIMATION_NAMES;
-    }
-
-    private getAnimationMarkov(): number[][] {
-        return this.isVehicle ? ANIMATION_MARKOV_VEHICLE : ANIMATION_MARKOV;
+        return this.animationNames;
     }
 
     public playAnimation(animationName: string): void {
-        this.currentAction = {
-            animation: animationName,
-            direction: this.currentAction.direction,
-            timestamp: 0,
-        };
-        this.character.state.setAnimation(0, animationName, true);
-        console.debug("Play action", this.currentAction);
+        this.startAction(this.makeAction(animationName, this.currentAction.direction));
     }
 
     public getCanvasId(): string {

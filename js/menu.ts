@@ -1,4 +1,5 @@
 import { Character } from './character';
+import { currentLang, Lang } from './lang';
 import { CharacterModel } from './types';
 
 import '../styles.css';
@@ -7,188 +8,140 @@ interface MenuCallbacks {
     getCharacterModels?: () => CharacterModel[];
     onSelectCharacter?: (c: Character, model: CharacterModel) => void;
     onHideCharacter?: (c: Character) => void;
+    aboutUrl?: string;
 }
+
+const LABELS: { [lang in Lang]: { [key: string]: string } } = {
+    zh: {
+        characters: '角色', actions: '动作', hide: '隐藏', about: '关于',
+        Relax: '待机', Move: '走动', Sit: '坐下', Sleep: '睡觉', Interact: '互动', Special: '特殊',
+    },
+    en: {
+        characters: 'Characters', actions: 'Actions', hide: 'Hide', about: 'About',
+        Relax: 'Idle', Move: 'Walk', Sit: 'Sit', Sleep: 'Sleep', Interact: 'Interact', Special: 'Special',
+    },
+};
+
+const SCREEN_MARGIN = 4;
 
 function positionElement(element: HTMLElement, x: number, y: number, parentRect?: DOMRect): void {
     const { innerWidth, innerHeight } = window;
     const { offsetWidth, offsetHeight } = element;
-    
-    // Calculate position, ensuring the element stays within the window
-    let left = x;
-    const top = Math.min(y, innerHeight - offsetHeight - 1);
 
-    // For submenus, check if there's space on the right side
-    if (parentRect) {
-        // If not enough space on the right, show on the left side
-        if (x + offsetWidth > innerWidth - 1) {
-            left = parentRect.left - offsetWidth;
-        }
-    } else {
-        // For main menu, just ensure it's within bounds
-        left = Math.min(x, innerWidth - offsetWidth - 1);
+    let left = x;
+    // A submenu that doesn't fit on the right opens on the left of its parent
+    if (parentRect && x + offsetWidth > innerWidth - SCREEN_MARGIN) {
+        left = parentRect.left - offsetWidth;
     }
-    
+    left = Math.max(SCREEN_MARGIN, Math.min(left, innerWidth - offsetWidth - SCREEN_MARGIN));
+    const top = Math.max(SCREEN_MARGIN, Math.min(y, innerHeight - offsetHeight - SCREEN_MARGIN));
+
     element.style.left = `${left}px`;
     element.style.top = `${top}px`;
 }
 
-function createCharactersSubmenu(c: Character, models: CharacterModel[], callbacks: MenuCallbacks): HTMLElement {
-    const charactersList = document.createElement('div');
-    charactersList.className = 'arkpets-submenu';
-    
-    models.forEach(model => {
-        const item = document.createElement('div');
-        item.innerHTML = model.name;
-        item.classList.add('arkpets-menu-item');
-        item.onclick = () => {
+function createMenuItem(label: string, onClick?: () => void): HTMLElement {
+    const item = document.createElement('div');
+    item.className = 'arkpets-menu-item';
+    item.textContent = label;
+    if (onClick) {
+        item.onclick = (e) => {
+            e.stopPropagation();
             removeMenu();
-            const callback = callbacks.onSelectCharacter ?? (() => c.loadCharacterModel(model));
-            callback(c, model);
+            onClick();
         };
-        charactersList.appendChild(item);
-    });
-
-    return charactersList;
+    }
+    return item;
 }
 
-function createActionsSubmenu(c: Character): HTMLElement {
-    const actionsList = document.createElement('div');
-    actionsList.className = 'arkpets-submenu';
-    
-    c.getAnimationNames().forEach(animation => {
-        const item = document.createElement('div');
-        item.innerHTML = animation;
-        item.classList.add('arkpets-menu-item');
-        item.onclick = () => {
-            removeMenu();
-            c.playAnimation(animation);
-        };
-        actionsList.appendChild(item);
-    });
+function addSubmenu(menu: HTMLElement, label: string, items: HTMLElement[]): void {
+    const parent = createMenuItem(`${label} ▶`);
+    const submenu = document.createElement('div');
+    submenu.className = 'arkpets-submenu';
+    items.forEach(item => submenu.appendChild(item));
+    submenu.style.display = 'none';
+    parent.appendChild(submenu);
 
-    return actionsList;
+    const open = () => {
+        menu.querySelectorAll<HTMLElement>('.arkpets-submenu').forEach(s => s.style.display = 'none');
+        submenu.style.display = 'block';
+        const rect = parent.getBoundingClientRect();
+        positionElement(submenu, rect.right, rect.top, rect);
+    };
+    // Hover for mice, click for touch. Touch also fires an emulated mouseover first,
+    // so click must only ever open, not toggle.
+    parent.onmouseover = open;
+    parent.onclick = open;
+    parent.onmouseout = (e) => {
+        if (!parent.contains(e.relatedTarget as Node | null)) {
+            submenu.style.display = 'none';
+        }
+    };
+
+    menu.appendChild(parent);
 }
 
 export function showContextMenu(e: MouseEvent | TouchEvent, c: Character, callbacks: MenuCallbacks): void {
     e.preventDefault();
-    
-    // Remove existing menu if it exists
-    if (document.getElementById('arkpets-menu')) {
-        removeMenu();
-    }
+    removeMenu();
 
+    const labels = LABELS[currentLang()];
     const menu = document.createElement('div');
     menu.id = 'arkpets-menu';
-    
-    const applyMenuItemStyles = (element: HTMLElement) => {
-        element.classList.add('arkpets-menu-item');
-    };
 
     // Add Characters submenu if there are characters
     const models = callbacks.getCharacterModels?.();
     if (models && models.length > 0) {
-        const charactersMenu = document.createElement('div');
-        charactersMenu.className = 'arkpets-menu-item';
-        charactersMenu.innerHTML = 'Characters ▶';
-        
-        let charactersList: HTMLElement | null = null;
-        charactersMenu.onmouseover = () => {
-            if (!charactersList) {
-                charactersList = createCharactersSubmenu(c, models, callbacks);
-                charactersMenu.appendChild(charactersList);
-                // Position submenu relative to its parent
-                const rect = charactersMenu.getBoundingClientRect();
-                positionElement(charactersList, rect.right, rect.top, rect);
-            }
-            charactersList.style.display = 'block';
-        };
-        charactersMenu.onmouseout = () => {
-            if (charactersList) {
-                charactersList.style.display = 'none';
-            }
-        };
-        
-        applyMenuItemStyles(charactersMenu);
-        menu.appendChild(charactersMenu);
+        addSubmenu(menu, labels.characters, models.map(model => {
+            const item = createMenuItem(model.name, () => {
+                const select = callbacks.onSelectCharacter ?? (() => c.loadCharacterModel(model));
+                select(c, model);
+            });
+            item.classList.toggle('arkpets-menu-current', model.id === c.getModel().id);
+            return item;
+        }));
     }
 
-    // Create Actions menu item
-    const actionsMenu = document.createElement('div');
-    actionsMenu.className = 'arkpets-menu-item';
-    actionsMenu.innerHTML = 'Actions ▶';
-    
-    let actionsList: HTMLElement | null = null;
-    actionsMenu.onmouseover = () => {
-        if (!actionsList) {
-            actionsList = createActionsSubmenu(c);
-            actionsMenu.appendChild(actionsList);
-            // Position submenu relative to its parent
-            const rect = actionsMenu.getBoundingClientRect();
-            positionElement(actionsList, rect.right, rect.top, rect);
-        }
-        actionsList.style.display = 'block';
-    };
-    actionsMenu.onmouseout = () => {
-        if (actionsList) {
-            actionsList.style.display = 'none';
-        }
-    };
-    
-    applyMenuItemStyles(actionsMenu);
-    menu.appendChild(actionsMenu);
+    addSubmenu(menu, labels.actions, c.getAnimationNames().map(animation =>
+        createMenuItem(labels[animation] ?? animation, () => c.playAnimation(animation))
+    ));
 
-    // Add Hide menu item
-    const hideMenu = document.createElement('div');
-    hideMenu.className = 'arkpets-menu-item';
-    hideMenu.innerHTML = 'Hide';
-    hideMenu.onclick = () => {
-        removeMenu();
-        const callback = callbacks.onHideCharacter ?? (() => {
-            c.fadeOut().then(() => {
-                c.destroy();
-            });
+    menu.appendChild(createMenuItem(labels.hide, () => {
+        const hide = callbacks.onHideCharacter ?? (() => {
+            c.fadeOut().then(() => c.destroy());
         });
-        callback(c);
-    };
-    applyMenuItemStyles(hideMenu);
-    
-    // Add About menu item
-    const aboutMenu = document.createElement('div');
-    aboutMenu.className = 'arkpets-menu-item';
-    aboutMenu.innerHTML = 'About';
-    aboutMenu.onclick = () => {
-        removeMenu();
-        window.open('https://github.com/fuyufjh/ArkPets-Web/', '_blank');
-    };
-    applyMenuItemStyles(aboutMenu);
-    
-    menu.appendChild(hideMenu);
-    menu.appendChild(aboutMenu);
-    
-    // Position the main menu at click/touch position
-    const pageX = 'touches' in e ? e.touches[0].pageX : (e as MouseEvent).pageX;
-    const pageY = 'touches' in e ? e.touches[0].pageY : (e as MouseEvent).pageY;
-    
+        hide(c);
+    }));
+
+    menu.appendChild(createMenuItem(labels.about, () => {
+        window.open(callbacks.aboutUrl ?? 'https://github.com/fuyufjh/ArkPets-Web/', '_blank', 'noopener');
+    }));
+
+    // The menu is position: fixed, so use client coordinates
+    const point = 'touches' in e ? e.touches[0] : e;
     document.body.appendChild(menu);
-    positionElement(menu, pageX, pageY);
+    positionElement(menu, point.clientX, point.clientY);
 
     // Remove menu when clicking outside
-    const handleClickOutside = (e: MouseEvent) => {
-        if (!menu.contains(e.target as Node)) {
+    const handleClickOutside = (event: MouseEvent) => {
+        if (!menu.contains(event.target as Node)) {
             removeMenu();
-            document.removeEventListener('click', handleClickOutside);
         }
     };
-    
+    menuCleanup = () => document.removeEventListener('click', handleClickOutside);
+
     // Delay adding the click listener to prevent immediate removal
     setTimeout(() => {
-        document.addEventListener('click', handleClickOutside);
+        if (menu.isConnected) {
+            document.addEventListener('click', handleClickOutside);
+        }
     }, 0);
 }
 
+let menuCleanup: (() => void) | null = null;
+
 function removeMenu(): void {
-    const menu = document.getElementById('arkpets-menu');
-    if (menu) {
-        menu.remove();
-    }
+    document.getElementById('arkpets-menu')?.remove();
+    menuCleanup?.();
+    menuCleanup = null;
 }

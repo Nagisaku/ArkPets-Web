@@ -3,10 +3,10 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Spine Animation</title>
+    <title>ArkPets-Web</title>
     <style>
         * { margin: 0; padding: 0; }
-        body, html { 
+        body, html {
             height: 100%;
             font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
             background-color: #f5f5f5;
@@ -20,71 +20,16 @@
             font-size: clamp(1.8rem, 5vw, 2.5rem);
         }
         p {
-            margin: 1rem;
-            text-align: justify;
             max-width: 800px;
-            margin-left: auto;
-            margin-right: auto;
+            margin: 1rem auto;
             padding: 0 15px;
         }
     </style>
 </head>
 <body>
-    <h1>Arkpets-Web</h1>
-    <p>Lorem ipsum odor amet, consectetuer adipiscing elit. Odio sollicitudin est potenti ultrices dapibus consectetur. Elit ultricies natoque taciti libero magna ex dignissim. Montes felis sem urna habitasse purus taciti elit. Luctus litora ipsum donec taciti ullamcorper lacus semper. Amet sed massa luctus ridiculus platea at per. Justo consequat vulputate ut, per eleifend montes nostra penatibus.</p>
-    <p>Congue donec lectus, augue torquent nostra at tincidunt arcu. Libero auctor egestas vivamus maecenas potenti commodo. Vestibulum urna dictum duis mollis interdum proin sed. Lectus suscipit lorem varius semper dictum porta. Mattis semper fames massa eget fringilla bibendum ex. Varius iaculis mollis montes convallis velit vehicula.</p>
-    <p>Donec vulputate aptent maecenas ex litora. Ac torquent eleifend habitant dapibus penatibus auctor. Maximus natoque a quis ante inceptos conubia. Enim sociosqu platea risus phasellus; id in magnis laoreet dictum. Ornare facilisis vivamus consequat parturient tortor sodales; nibh hac consequat? Orci odio vivamus sollicitudin etiam, morbi hendrerit sem nisi. Posuere sit felis quisque nisi sit sed. Fermentum nisi nisi elementum sit senectus nibh efficitur purus.</p>
-    <p>Cursus placerat risus lectus eros sociosqu natoque ligula. Vestibulum tortor platea tempus ut ornare class. Etiam phasellus in ac praesent sapien. Interdum leo cras; habitasse praesent pellentesque eget accumsan pharetra. Rutrum inceptos donec potenti hendrerit ac integer cursus? Eleifend fringilla sagittis dis purus aliquam. Ultricies dis ligula lacus erat, ad taciti. Curabitur scelerisque commodo cursus fusce vel lectus. Himenaeos aptent imperdiet dis nunc habitant. Phasellus feugiat platea vel facilisi per aptent.</p>
-    <p>Lectus suscipit etiam nunc malesuada duis eros orci. Faucibus donec sociosqu semper vel ligula sociosqu aliquam. Eros suscipit potenti morbi urna ante quis egestas dui. Posuere aliquet phasellus interdum primis in commodo. Nisl class arcu sit libero; rhoncus curae litora. Pulvinar vestibulum sem viverra pulvinar tortor rutrum per ipsum. Ullamcorper tristique mollis lobortis ipsum cras, conubia sit eu!</p>
-    <script src="dist/arkpets.js"></script>
-    <script>
-        const RESOURCE_PATH = "/assets/models/";
-
-        const CHARACTER_RESOURCES = [
-            {
-                id: "pepe",
-                name: "佩佩",
-                skeleton: "4058_pepe/build_char_4058_pepe.skel",
-                atlas: "4058_pepe/build_char_4058_pepe.atlas",
-                texture: "4058_pepe/build_char_4058_pepe.png",
-                resourcePath: RESOURCE_PATH,
-            },
-            {
-                id: "whitw2",
-                name: "荒芜拉普兰德",
-                skeleton: "1038_whitw2/build_char_1038_whitw2.skel", 
-                atlas: "1038_whitw2/build_char_1038_whitw2.atlas",
-                texture: "1038_whitw2/build_char_1038_whitw2.png",
-                resourcePath: RESOURCE_PATH,
-            },
-            {
-                id: "frston-3",
-                name: "Friston-3",
-                skeleton: "4093_frston/build_char_4093_frston.skel",
-                atlas: "4093_frston/build_char_4093_frston.atlas", 
-                texture: "4093_frston/build_char_4093_frston.png",
-                resourcePath: RESOURCE_PATH,
-            },
-            {
-                id: "texas2",
-                name: "缄默德克萨斯",
-                skeleton: "1028_texas2_iteration#1/build_char_1028_texas2_iteration#1.skel",
-                atlas: "1028_texas2_iteration#1/build_char_1028_texas2_iteration#1.atlas",
-                texture: "1028_texas2_iteration#1/build_char_1028_texas2_iteration#1.png",
-                resourcePath: "https://raw.githubusercontent.com/isHarryh/Ark-Models/refs/heads/main/models/",
-            }
-        ];
-
-        window.addEventListener('load', () => {
-            const character = new arkpets.Character(
-                "arkpets-demo", 
-                (e) => arkpets.showContextMenu(e, character, {
-                    getCharacterModels: () => CHARACTER_RESOURCES,
-                }),
-                CHARACTER_RESOURCES[0],
-            );
-            console.log("Character initialized", character);
-        });
-    </script>
+    <h1>ArkPets-Web</h1>
+    <p>Run <code>npm run build</code> and <code>npm run models -- dist</code>, then serve this directory.</p>
+    <p>Drag the pet, click it, or right-click (long-press on touch screens) for the menu.</p>
+    <script src="dist/arkpets.js" data-arkpets-manifest="dist/manifest.json" defer></script>
 </body>
 </html>

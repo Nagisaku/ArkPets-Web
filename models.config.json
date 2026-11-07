@@ -1,0 +1,38 @@
+{
+  "source": {
+    "repository": "isHarryh/Ark-Models",
+    "commit": "e65fb9147846b64bcf2df956b8cd8da77a51b9b8",
+    "directory": "models"
+  },
+  "about": "https://github.com/Nagisaku/ArkPets-Web",
+  "defaultId": "391_rosmon_sale#16",
+  "models": [
+    {
+      "id": "391_rosmon_sale#16",
+      "name": { "zh": "迷迭香", "en": "Rosmontis" },
+      "skin": { "zh": "轻盈一梦", "en": "轻盈一梦" }
+    },
+    {
+      "id": "391_rosmon",
+      "name": { "zh": "迷迭香", "en": "Rosmontis" }
+    },
+    {
+      "id": "4058_pepe",
+      "name": { "zh": "佩佩", "en": "Pepe" }
+    },
+    {
+      "id": "4058_pepe_sightseer#2",
+      "name": { "zh": "佩佩", "en": "Pepe" },
+      "skin": { "zh": "星移", "en": "星移" }
+    },
+    {
+      "id": "1041_angel2",
+      "name": { "zh": "新约能天使", "en": "Exusiai the New Covenant" }
+    },
+    {
+      "id": "1041_angel2_iteration#6",
+      "name": { "zh": "新约能天使", "en": "Exusiai the New Covenant" },
+      "skin": { "zh": "寻翼之歌", "en": "寻翼之歌" }
+    }
+  ]
+}
