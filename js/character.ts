@@ -24,6 +24,7 @@ const MAX_PIXEL_RATIO = 2;
 const ANIMATION_MIX_SECONDS = 0.3;
 
 const DRAG_SLOP = 6; // pixels a pointer may travel and still count as a click or tap
+const THROW_SAMPLE_MS = 80;
 const LONG_PRESS_MS = 500;
 const TOUCH_HIT_RADIUS = 12; // fingers are less precise than a mouse
 
@@ -66,7 +67,8 @@ export class Character {
     private shader!: webgl.Shader;
     private batcher!: webgl.PolygonBatcher;
     private mvp!: webgl.Matrix4;
-    private assetManager!: webgl.AssetManager;
+    private texture?: webgl.GLTexture;
+    public readonly ready: Promise<boolean | null>;
     private skeletonRenderer!: webgl.SkeletonRenderer;
     private lastFrameTime!: number;
     private framebuffer!: WebGLFramebuffer;
@@ -83,7 +85,7 @@ export class Character {
     private dragOriginY: number = 0;
     private dragStartRelativeX: number = 0;
     private dragStartRelativeY: number = 0;
-    private lastDragTime: number | null = null;
+    private dragSamples: { x: number; y: number; time: number }[] = [];
     private longPressTimer: number | null = null;
     private longPressFired: boolean = false;
 
@@ -137,7 +139,7 @@ export class Character {
 
         // Load initial character
         this.loadFromSessionStorage();
-        this.loadCharacterModel(this.model);
+        this.ready = this.loadCharacterModel(this.model);
     }
 
     private initializeCanvas(canvasId: string): void {
@@ -168,7 +170,6 @@ export class Character {
         this.batcher = new webgl.PolygonBatcher(this.gl);
         this.skeletonRenderer = new webgl.SkeletonRenderer(new webgl.ManagedWebGLRenderingContext(this.gl));
         this.skeletonRenderer.premultipliedAlpha = true;
-        this.assetManager = new webgl.AssetManager(this.gl);
     }
 
     private setupEventListeners(): void {
@@ -250,59 +251,59 @@ export class Character {
         }
     }
 
-    public loadCharacterModel(model: CharacterModel) {
+    // true = displayed, false = failed, null = superseded by another load or destroy().
+    public async loadCharacterModel(model: CharacterModel): Promise<boolean | null> {
         const token = ++this.loadToken;
-
-        function encodeUriPath(path: string): string {
-            return encodeURIComponent(path).replace(/%2F/g, '/');
-        }
-        console.debug("Downloading character assets for", model.name);
-
-        // Download all resources.
-        // Here we use `setRawDataURI()` to manually load the resources because the path may contain `#` which is not allowed in URLs
-        const resources = [model.skeleton, model.atlas, model.texture];
-        const basePath = model.resourcePath ?? "";
-        Promise.all(resources.map(async resource => {
-            const response = await fetch(basePath + encodeUriPath(resource));
-            if (!response.ok) {
-                throw new Error(`${resource}: HTTP ${response.status}`);
+        const fetchResource = async (path: string) => {
+            const encoded = path.split('/').map(encodeURIComponent).join('/');
+            const response = await fetch((model.resourcePath ?? '') + encoded);
+            if (!response.ok) throw new Error(`${path}: HTTP ${response.status}`);
+            return response;
+        };
+        let pendingTexture: webgl.GLTexture | undefined;
+        try {
+            const [binary, atlasText, blob] = await Promise.all([
+                fetchResource(model.skeleton).then(r => r.arrayBuffer()),
+                fetchResource(model.atlas).then(r => r.text()),
+                fetchResource(model.texture).then(r => r.blob()),
+            ]);
+            if (token !== this.loadToken) return null;
+            const image = new Image();
+            image.src = URL.createObjectURL(blob);
+            try {
+                await image.decode();
+            } finally {
+                URL.revokeObjectURL(image.src);
             }
-            const blob = await response.blob();
-            const reader = new FileReader();
-            return new Promise<string>((resolve, reject) => {
-                reader.onloadend = () => resolve(reader.result as string);
-                reader.onerror = () => reject(reader.error);
-                reader.readAsDataURL(blob);
+            if (token !== this.loadToken) return null;
+
+            const texture = pendingTexture = new webgl.GLTexture(this.gl, image);
+            const atlas = new spine.TextureAtlas(atlasText, name => {
+                if (name !== model.texture.split('/').pop()) throw new Error(`Unexpected atlas page: ${name}`);
+                return texture;
             });
-        })).then(dataUrls => {
-            if (token !== this.loadToken) {
-                return; // a newer request or destroy() superseded this one
-            }
-
-            // The previous model keeps playing until the new one has fully arrived
-            if (this.animationFrameId !== null) {
-                cancelAnimationFrame(this.animationFrameId);
-                this.animationFrameId = null;
-            }
+            const character = this.loadCharacter(atlas, new Uint8Array(binary), MODEL_SCALE * this.pixelRatio * this.displayScale);
+            if (this.animationFrameId !== null) cancelAnimationFrame(this.animationFrameId);
+            this.texture?.dispose();
+            this.texture = pendingTexture;
+            pendingTexture = undefined;
             this.model = model;
-
-            resources.forEach((resource, i) => {
-                this.assetManager.setRawDataURI(resource, dataUrls[i]);
-            });
-
-            this.assetManager.removeAll();
-            this.assetManager.loadBinary(model.skeleton, () => {
-                this.assetManager.loadTextureAtlas(model.atlas, () => {
-                    console.debug("Loaded character assets for", model.name);
-                    resources.forEach((resource) => {
-                        this.assetManager.setRawDataURI(resource, ""); // release memory
-                    });
-                    this.animationFrameId = requestAnimationFrame(() => this.load(token));
-                });
-            });
-        }).catch(error => {
-            console.error("Failed to load character assets:", error);
-        });
+            this.character = character;
+            this.currentAction = this.makeAction("Relax", this.currentAction.direction);
+            this.lastFrameTime = performance.now() / 1000;
+            if (!Number.isFinite(this.position.x)) {
+                const { minX, maxX } = this.horizontalBounds();
+                this.position.x = minX + Math.random() * (maxX - minX);
+            }
+            this.render();
+            return true;
+        } catch (error) {
+            if (token !== this.loadToken) return null;
+            console.error("Failed to load character:", model.name, error);
+            return false;
+        } finally {
+            pendingTexture?.dispose();
+        }
     }
 
     public fadeOut(): Promise<void> {
@@ -339,31 +340,6 @@ export class Character {
         } catch (e) { /* start from the default position */ }
     }
 
-    private load(token: number): void {
-        if (token !== this.loadToken) {
-            return;
-        }
-        if (!this.assetManager.isLoadingComplete()) {
-            console.debug("Loading assets of character", this.model.name, "progress", this.assetManager.getLoaded(), "/", this.assetManager.getToLoad());
-            this.animationFrameId = requestAnimationFrame(() => this.load(token));
-            return;
-        }
-
-        this.character = this.loadCharacter(this.model, MODEL_SCALE * this.pixelRatio * this.displayScale);
-        this.currentAction = this.makeAction("Relax", this.currentAction.direction);
-        this.character.state.setAnimation(0, "Relax", true);
-
-        this.lastFrameTime = Date.now() / 1000;
-
-        // Generate random x position if it's not set yet
-        if (!Number.isFinite(this.position.x)) {
-            const { minX, maxX } = this.horizontalBounds();
-            this.position.x = minX + Math.random() * (maxX - minX);
-        }
-
-        this.animationFrameId = requestAnimationFrame(this.render.bind(this));
-    }
-
     private horizontalBounds(): { minX: number; maxX: number } {
         const margin = (CANVAS_WIDTH - BODY_WIDTH) / 2 * this.displayScale;
         return {
@@ -372,22 +348,21 @@ export class Character {
         };
     }
 
-    private loadCharacter(resource: CharacterModel, scale: number = 1.0): SpineCharacter {
-        const atlas = this.assetManager.get(resource.atlas);
+    private loadCharacter(atlas: spine.TextureAtlas, binary: Uint8Array, scale: number): SpineCharacter {
         const atlasLoader = new spine.AtlasAttachmentLoader(atlas);
         const skeletonBinary = new spine.SkeletonBinary(atlasLoader);
 
         skeletonBinary.scale = scale;
-        const skeletonData = skeletonBinary.readSkeletonData(this.assetManager.get(resource.skeleton));
+        const skeletonData = skeletonBinary.readSkeletonData(binary);
         const skeleton = new spine.Skeleton(skeletonData);
 
-        this.animationNames = Object.keys(BEHAVIORS).filter(name => skeletonData.findAnimation(name) !== null);
+        const animationNames = Object.keys(BEHAVIORS).filter(name => skeletonData.findAnimation(name) !== null);
 
         const animationStateData = new spine.AnimationStateData(skeleton.data);
 
         // Animation transitions
-        this.animationNames.forEach(fromAnim => {
-            this.animationNames.forEach(toAnim => {
+        animationNames.forEach(fromAnim => {
+            animationNames.forEach(toAnim => {
                 if (fromAnim !== toAnim) {
                     animationStateData.setMix(fromAnim, toAnim, ANIMATION_MIX_SECONDS);
                 }
@@ -395,6 +370,9 @@ export class Character {
         });
 
         const animationState = new spine.AnimationState(animationStateData);
+
+        animationState.setAnimation(0, "Relax", true);
+        this.animationNames = animationNames;
 
         // Listen for animation completion
         const self = this;
@@ -457,7 +435,7 @@ export class Character {
     }
 
     private render(): void {
-        const now = Date.now() / 1000;
+        const now = performance.now() / 1000;
         // Limit delta to 0.1s, effectively pausing the animation when the window is in background
         const delta = Math.min(now - this.lastFrameTime, 0.1);
         this.lastFrameTime = now;
@@ -477,9 +455,6 @@ export class Character {
             this.velocity.y *= drag;
             if (Math.abs(this.velocity.x) < MIN_VELOCITY) {
                 this.velocity.x = 0;
-            }
-            if (Math.abs(this.velocity.y) < MIN_VELOCITY) {
-                this.velocity.y = 0;
             }
 
             // Clamp velocities
@@ -659,7 +634,7 @@ export class Character {
         }
     }
 
-    private beginDrag(clientX: number, clientY: number): void {
+    private beginDrag(clientX: number, clientY: number, time: number): void {
         this.isDragging = true;
         this.dragMoved = false;
         this.dragOriginX = clientX;
@@ -667,7 +642,7 @@ export class Character {
         this.dragStartRelativeX = clientX - this.position.x;
         this.dragStartRelativeY = clientY - this.position.y;
         this.velocity = { x: 0, y: 0 };
-        this.lastDragTime = null;
+        this.dragSamples = [{ x: clientX, y: clientY, time }];
 
         // Pause any current animation
         if (this.character) {
@@ -679,15 +654,8 @@ export class Character {
         const newX = clientX - this.dragStartRelativeX;
         const newY = clientY - this.dragStartRelativeY;
 
-        // Calculate velocity based on time between events
-        if (this.lastDragTime !== null) {
-            const dt = (timeStamp - this.lastDragTime) / 1000;
-            if (dt > 0) {
-                this.velocity.x = (newX - this.position.x) / dt;
-                this.velocity.y = (newY - this.position.y) / dt;
-            }
-        }
-        this.lastDragTime = timeStamp;
+        this.dragSamples = this.dragSamples.filter(sample => timeStamp - sample.time <= THROW_SAMPLE_MS);
+        this.dragSamples.push({ x: clientX, y: clientY, time: timeStamp });
 
         if (Math.hypot(clientX - this.dragOriginX, clientY - this.dragOriginY) > DRAG_SLOP) {
             this.dragMoved = true;
@@ -699,15 +667,24 @@ export class Character {
         this.canvas.style.transform = `translate(${this.position.x}px, ${this.position.y}px)`;
     }
 
-    private endDrag(): void {
+    private endDrag(event?: MouseEvent | TouchEvent): void {
+        if (event && this.isDragging && this.dragMoved && event.type !== 'touchcancel') {
+            const point = 'changedTouches' in event ? event.changedTouches[0] : event;
+            const first = this.dragSamples.find(sample => event.timeStamp - sample.time <= THROW_SAMPLE_MS);
+            if (point && first && event.timeStamp > first.time) {
+                const seconds = (event.timeStamp - first.time) / 1000;
+                this.velocity.x = (point.clientX - first.x) / seconds;
+                this.velocity.y = (point.clientY - first.y) / seconds;
+            }
+        }
         this.isDragging = false;
-        this.lastDragTime = null;
+        this.dragSamples = [];
     }
 
     private handleMouseDown(e: MouseEvent): void {
         if (e.button === 0) {
             e.preventDefault(); // don't start a text selection
-            this.beginDrag(e.clientX, e.clientY);
+            this.beginDrag(e.clientX, e.clientY, e.timeStamp);
         }
     }
 
@@ -745,7 +722,7 @@ export class Character {
         }
 
         e.preventDefault(); // no scrolling and no synthesized mouse events
-        this.beginDrag(touch.clientX, touch.clientY);
+        this.beginDrag(touch.clientX, touch.clientY, e.timeStamp);
         this.longPressFired = false;
         this.longPressTimer = window.setTimeout(() => {
             this.longPressTimer = null;
@@ -767,10 +744,10 @@ export class Character {
         }
     }
 
-    private handleTouchEnd(): void {
+    private handleTouchEnd(e: TouchEvent): void {
         const wasDragging = this.isDragging;
         this.clearLongPress();
-        this.endDrag();
+        this.endDrag(e);
         if (wasDragging && !this.dragMoved && !this.longPressFired) {
             this.interact();
         }
@@ -805,9 +782,7 @@ export class Character {
             sessionStorage.removeItem(this.sessionKey());
         } catch (e) { /* nothing to clear */ }
 
-        // Clear asset manager
-        this.assetManager.removeAll();
-        this.assetManager.dispose();
+        this.texture?.dispose();
 
         // Browsers limit the number of WebGL contexts, so release this one now
         this.gl.getExtension('WEBGL_lose_context')?.loseContext();

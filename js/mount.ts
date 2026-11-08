@@ -79,16 +79,16 @@ export async function mount(manifestUrl: string): Promise<void> {
         restoreButton = button;
     }
 
-    function showPet(): void {
-        const model = findModel(readStorage(STORAGE_MODEL)) ?? findModel(manifest.defaultId) ?? manifest.models[0];
+    async function showPet(): Promise<void> {
+        const fallback = findModel(manifest.defaultId) ?? manifest.models[0];
+        const model = findModel(readStorage(STORAGE_MODEL)) ?? fallback;
         const displayScale = window.matchMedia(SMALL_SCREEN).matches ? SMALL_SCREEN_SCALE : 1;
         const character: Character = new Character(
             CANVAS_ID,
             (e) => showContextMenu(e, character, {
                 getCharacterModels: () => manifest.models.map(toCharacterModel),
-                onSelectCharacter: (c, selected) => {
-                    writeStorage(STORAGE_MODEL, selected.id);
-                    c.loadCharacterModel(selected);
+                onSelectCharacter: async (c, selected) => {
+                    if (await c.loadCharacterModel(selected)) writeStorage(STORAGE_MODEL, selected.id);
                 },
                 onHideCharacter: (c) => {
                     writeStorage(STORAGE_HIDDEN, '1');
@@ -103,6 +103,15 @@ export async function mount(manifestUrl: string): Promise<void> {
             true,
             displayScale,
         );
+        let displayed = await character.ready;
+        if (displayed === false && model.id !== fallback.id) {
+            displayed = await character.loadCharacterModel(toCharacterModel(fallback));
+            if (displayed) writeStorage(STORAGE_MODEL, fallback.id);
+        }
+        if (displayed === false) {
+            character.destroy();
+            showRestoreButton();
+        }
     }
 
     // With prefers-reduced-motion, start hidden and show the button instead
@@ -111,6 +120,6 @@ export async function mount(manifestUrl: string): Promise<void> {
     if (hiddenPref === '1' || (hiddenPref === null && reducedMotion)) {
         showRestoreButton();
     } else {
-        showPet();
+        await showPet();
     }
 }
